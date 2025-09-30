@@ -28,6 +28,7 @@ from .utility.calculateMotorPositions import get_motor_positions
 from std_srvs.srv import Trigger
 from std_msgs.msg import Float32MultiArray
 from cablerobot_interfaces.msg import ManualCommand
+from cablerobot_interfaces.msg import MotorPositionCommand
 
 
 class CableRobotControlNode(Node):
@@ -78,10 +79,17 @@ class CableRobotControlNode(Node):
         self.getWorkspaceService_ = self.create_service(Trigger, "acquire_workspace", self.callbackGetWorkspace)
 
         # Motor position declarations
-        self.motor_position_command_ = self.create_subscription(
-            ManualCommand, "motor_command", self.callbackManualCommand, 10
+        self.end_effector_command_ = self.create_subscription(
+            ManualCommand, "end_effector_position_command", self.callbackManualCommand, 10
         )
+
         self.motor_position_pub_ = self.create_publisher(Float32MultiArray, "motor_position", 10)
+        self.create_timer(0.1, self.callbackPublishMotorPosition)
+
+        # Automatic control declarations
+        self.automatic_motor_position_command_ = self.create_subscription(
+            MotorPositionCommand, "motor_position_command", self.callbackAutoCommand, 10
+        )
 
         # Motor Velocity Declarations
         self.create_timer(0.01, self.callbackCalculateVelocity)
@@ -91,13 +99,11 @@ class CableRobotControlNode(Node):
 
         self.get_logger().info("Cable Robot Control Node Initialized")
 
-    def setMotorPositions(self, motorPositions: NDArray):
+    def setMotorPositions(self, motorPositions):
         if self.od1.axis0.current_state != AxisState.CLOSED_LOOP_CONTROL:
             self.get_logger().warn("Motors not in closed loop control mode. Position not set.")
         else:
-            # self.get_logger().info(f"{self.od1.axis0.controller.config.control_mode}")
-            # self.get_logger().info(f"{self.od1.axis0.controller.config.input_mode}")
-            # TODO: Update this function to handle all motor
+            # TODO: Update this function to handle all motors
             self.get_logger().warn(f"{motorPositions[0]}{motorPositions[1]}")
             self.od1.axis0.controller.input_pos = motorPositions[0]
             # self.od2.axis0.controller.input_pos = motorPositions[1]
@@ -238,6 +244,19 @@ class CableRobotControlNode(Node):
 
         return response
 
+    def callbackAutoCommand(self, msg: MotorPositionCommand):
+        command = msg.command
+
+        if not self.motors_active:
+            for motor in self.motors:
+                motor.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL  # type: ignore[attr-defined]
+                motor.axis0.controller.config.input_mode = InputMode.POS_FILTER  # type: ignore[attr-defined]
+                motor.axis0.controller.config.control_mode = ControlMode.POSITION_CONTROL  # type: ignore[attr-defined]
+
+            self.motors_active = True
+
+        self.setMotorPositions(command)
+
     def callbackManualCommand(self, msg: ManualCommand):
         command = msg.command
 
@@ -250,15 +269,6 @@ class CableRobotControlNode(Node):
                         motor.axis0.controller.config.control_mode = ControlMode.TORQUE_CONTROL  # type: ignore[attr-defined]
                     self.motors_mode = ControlMode.TORQUE_CONTROL
                     self.motors_active = True
-
-                # case 2:  # Velocity Control
-                #     for motor in self.motors:
-                #         motor.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL  # type: ignore[attr-defined]
-                #         motor.axis0.controller.config.input_mode = InputMode.VEL_RAMP  # type: ignore[attr-defined]
-                #         motor.axis0.controller.config.control_mode = ControlMode.VELOCITY_CONTROL  # type: ignore[attr-defined]
-
-                #     self.motors_mode = ControlMode.VELOCITY_CONTROL
-                #     self.motors_active = True
 
                 case 3:  # Position Control
                     for motor in self.motors:
@@ -287,6 +297,13 @@ class CableRobotControlNode(Node):
                 self.get_logger().info(f"Commanded Pos = {command[0]:.2f},{command[1]:.2f}")
             case _:
                 self.get_logger().info("Invalid case...")
+
+    def callbackPublishMotorPosition(self):
+        positions = Float32MultiArray
+
+        positions.data = self.getMotorPositions()
+
+        self.motor_position_pub_.publish(positions)
 
     def callbackCalculateVelocity(self):
         window_size = 10
