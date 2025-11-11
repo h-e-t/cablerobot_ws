@@ -9,7 +9,6 @@ from rclpy import Parameter
 # External Imports
 import time
 import numpy as np
-from collections import deque
 
 # Odrive imports
 import odrive
@@ -23,6 +22,7 @@ import odrive.utils as utils
 # Internal Imports
 from .utility.getStaticTorques import getStaticTorques
 from .utility.calculateMotorPositions import get_motor_positions
+from .utility.calculateMotorPositions import CableRobotCalculator
 
 # Interfaces
 from std_srvs.srv import Trigger
@@ -35,14 +35,17 @@ class CableRobotControlNode(Node):
     def __init__(self):
         super().__init__("CableRobotControlNode")
 
-        self.od1_SN = 261832858530  # Far Left
-        self.od2_SN = 997655138845  # Middle left
-        self.od3_SN = 126362882843  # Middle Right (TESTING DEVICE)
-        self.od4_SN = 144157530696  # Far Right
+        self.calculator = CableRobotCalculator()
+
+        self.od1_SN = 261832858530  # Middle left  (Bottom left)
+        self.od2_SN = 144157530696  # Middle Right (Bottom Right)
+        self.od3_SN = 126362882843  # Far Right    (Top Right)
+        self.od4_SN = 997655138845  # Far Left     (Top Left)
 
         self.motors = [None] * 4
 
-        connectedBoards = odrive.find_sync(count=2)
+        # Connecting to motors in order
+        connectedBoards = odrive.find_sync(count=4)
         for motor in connectedBoards:  # type: ignore[attr-defined]
             match motor.serial_number:
                 case self.od1_SN:
@@ -65,6 +68,16 @@ class CableRobotControlNode(Node):
         self.motors = [m for m in self.motors if m is not None]
         self.declare_parameter("motor_position_offsets", [0.0] * len(self.motors))
 
+        self.set_parameters(
+            [
+                rclpy.Parameter(
+                    "motor_position_offsets",
+                    rclpy.Parameter.Type.DOUBLE_ARRAY,
+                    list(self.getMotorPositions()),
+                )
+            ]
+        )
+
         self.motors_mode = None
         self.motors_active = False
 
@@ -80,7 +93,10 @@ class CableRobotControlNode(Node):
 
         # Motor position declarations
         self.end_effector_command_ = self.create_subscription(
-            ManualCommand, "end_effector_position_command", self.callbackManualCommand, 10
+            ManualCommand,
+            "end_effector_position_command",
+            self.callbackManualCommand,
+            10,
         )
 
         self.motor_position_pub_ = self.create_publisher(Float32MultiArray, "motor_position", 10)
@@ -91,24 +107,22 @@ class CableRobotControlNode(Node):
             MotorPositionCommand, "motor_position_command", self.callbackAutoCommand, 10
         )
 
-        # Motor Velocity Declarations
-        self.create_timer(0.01, self.callbackCalculateVelocity)
-        self.prev_pos = self.getMotorPositions()
-        self.vel_buffer = deque(maxlen=10)
-        self.vel_avg = np.zeros(4)
-
         self.get_logger().info("Cable Robot Control Node Initialized")
 
     def setMotorPositions(self, motorPositions):
         if self.od1.axis0.current_state != AxisState.CLOSED_LOOP_CONTROL:
-            self.get_logger().warn("Motors not in closed loop control mode. Position not set.")
+            self.get_logger().warn(
+                f"Motors not in closed loop control mode. Position not set.\nCurrent State = {self.od1.axis0.current_state}"
+            )
         else:
-            # TODO: Update this function to handle all motors
-            self.get_logger().warn(f"{motorPositions[0]}{motorPositions[1]}")
+            # TODO: Command All Motors
+            self.get_logger().info(f"\nCommanding : {motorPositions} \n Current Position: {self.getMotorPositions()}")
+
+            print(f"Motor positions in command: {motorPositions}")
             self.od1.axis0.controller.input_pos = motorPositions[0]
-            # self.od2.axis0.controller.input_pos = motorPositions[1]
-            # self.od3.axis0.controller.input_pos = motorPositions[2]
-            self.od4.axis0.controller.input_pos = motorPositions[1]
+            self.od2.axis0.controller.input_pos = motorPositions[1]
+            self.od3.axis0.controller.input_pos = motorPositions[2]
+            self.od4.axis0.controller.input_pos = motorPositions[3]
 
     def getMotorPositions(self) -> NDArray:
         positions = np.zeros(len(self.motors))
@@ -133,13 +147,10 @@ class CableRobotControlNode(Node):
             motor.axis0.requested_state = AxisState.IDLE  # type: ignore[attr-defined]
 
     def setCagePosition(self, x, y):
-        reference_motor_positions: NDArray = np.array(self.get_parameter("motor_position_offsets").value)
-
-        positions_required = get_motor_positions(x, y, reference_motor_positions)
-
-        print(f"{reference_motor_positions}  {positions_required}")
-
+        reference_motor_positions = np.array(self.get_parameter("motor_position_offsets").value)
+        positions_required = self.calculator.get_motor_positions(x, y)
         self.setMotorPositions(positions_required)
+        print(f"{reference_motor_positions}  {positions_required}")
 
     def callbackCalibrateMotors(self, request: Trigger.Request, response: Trigger.Response):
         response = Trigger.Response()
@@ -154,6 +165,8 @@ class CableRobotControlNode(Node):
         for motor in self.motors:
             if motor.axis0.current_state == AxisState.IDLE:  # type: ignore[attr-defined]
                 motor.axis0.requested_state = AxisState.FULL_CALIBRATION_SEQUENCE  # type: ignore[attr-defined]
+                motor.save_configuration()
+                # motor.axis0.requested_state = AxisState.MOTOR_CALIBRATION  # type: ignore[attr-defined]
             else:
                 response.success = False
                 response.message = "Motors not idle. State incompatible with calibration"
@@ -168,6 +181,7 @@ class CableRobotControlNode(Node):
             response.message = "Calibration Succeded"
 
         self.set_parameters([Parameter("calibrated", Parameter.Type.BOOL, True)])
+        self.calibrated = True
         return response
 
     def callbackGetWorkspace(self, request: Trigger.Request, response: Trigger.Response):
@@ -187,23 +201,9 @@ class CableRobotControlNode(Node):
         self.get_logger().info("Starting workspace acquisition.")
         self.get_logger().info("Place carriage at calibration position.")
 
-        # 4 Motor Case
-        torques = [-0.1, 0.1, 0.1, -0.1]
-
-        # 2 Motor Case
-        torques = [0.2, -0.2]
-
-        # Arbitrary torque that allows motors to maintain tension in their respective cables
-
-        for i, motor in enumerate(self.motors):
-            motor.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL  # type: ignore[attr-defined]
-            motor.axis0.controller.config.control_mode = ControlMode.TORQUE_CONTROL  # type: ignore[attr-defined]
-            motor.axis0.controller.config.input_mode = InputMode.PASSTHROUGH  # type: ignore[attr-defined]
-            motor.axis0.controller.input_torque = torques[i]  # type: ignore[attr-defined]
-
         motorPositions: NDArray = self.getMotorPositions()
 
-        self.get_logger().info("Counting down until motor offset is set.")
+        self.get_logger().info("Counting down until motor offset is set. Spin Motors to place in reference Position.")
         countdown = timeout
         start = time.time()
 
@@ -219,25 +219,32 @@ class CableRobotControlNode(Node):
                 response.message = msg
 
                 self.set_parameters(
-                    [rclpy.Parameter("motor_position_offsets", rclpy.Parameter.Type.DOUBLE_ARRAY, list(motorPositions))]
+                    [
+                        rclpy.Parameter(
+                            "motor_position_offsets",
+                            rclpy.Parameter.Type.DOUBLE_ARRAY,
+                            list(motorPositions),
+                        )
+                    ]
                 )
+
+                self.calculator.set_reference_motor_positions(motorPositions)
 
                 break
 
             self.get_logger().info(f"{countdown}...")
             countdown -= 1  # type: ignore[attr-defined]
 
-        self.get_logger().info("Calibration positions acquired. Stopping motors...")
-
+        self.get_logger().info("Calibration positions acquired.")
         self.get_logger().info("Motor offsets recorded")
 
         for i, offset in enumerate(self.get_parameter("motor_position_offsets").value):  # type: ignore[attr-defined]
             self.get_logger().info(f"Motor {i + 1} offset = {offset}")
 
-        self.setCagePosition(0, 15)
-
         for motor in self.motors:
             utils.dump_errors(motor)  # type: ignore[attr-defined]
+
+        self.setCagePosition(0, 12.94)
 
         response.success = True
         response.message = "Calibration positions acquired"
@@ -249,9 +256,11 @@ class CableRobotControlNode(Node):
 
         if not self.motors_active:
             for motor in self.motors:
+                self.get_logger().info(f"Motor {motor.serial_number} in closed_loop_control")
                 motor.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL  # type: ignore[attr-defined]
                 motor.axis0.controller.config.input_mode = InputMode.POS_FILTER  # type: ignore[attr-defined]
                 motor.axis0.controller.config.control_mode = ControlMode.POSITION_CONTROL  # type: ignore[attr-defined]
+                time.sleep(0.1)
 
             self.motors_active = True
 
@@ -261,61 +270,37 @@ class CableRobotControlNode(Node):
         command = msg.command
 
         if not self.motors_active:
-            match msg.state:
-                case 1:  # Torque Control
-                    for motor in self.motors:
-                        motor.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL  # type: ignore[attr-defined]
-                        motor.axis0.controller.config.input_mode = InputMode.TORQUE_RAMP  # type: ignore[attr-defined]
-                        motor.axis0.controller.config.control_mode = ControlMode.TORQUE_CONTROL  # type: ignore[attr-defined]
-                    self.motors_mode = ControlMode.TORQUE_CONTROL
-                    self.motors_active = True
+            self.get_logger().info("Setting Motors to closed loop control")
+            for motor in self.motors:
+                motor.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL  # type: ignore[attr-defined]
+                motor.axis0.controller.config.input_mode = InputMode.POS_FILTER  # type: ignore[attr-defined]
+                motor.axis0.controller.config.control_mode = ControlMode.POSITION_CONTROL  # type: ignore[attr-defined]
 
-                case 3:  # Position Control
-                    for motor in self.motors:
-                        motor.axis0.requested_state = AxisState.CLOSED_LOOP_CONTROL  # type: ignore[attr-defined]
-                        motor.axis0.controller.config.input_mode = InputMode.POS_FILTER  # type: ignore[attr-defined]
-                        motor.axis0.controller.config.control_mode = ControlMode.POSITION_CONTROL  # type: ignore[attr-defined]
+            self.motors_mode = ControlMode.POSITION_CONTROL
+            self.motors_active = True
 
-                    self.motors_mode = ControlMode.POSITION_CONTROL
-                    self.motors_active = True
+        match msg.state:
+            case 0:  # spooling
+                self.get_logger().info("Spooling....")
+                offset = self.get_parameter("motor_position_offsets").value
+                print(f"{offset} offset")
+                self.setMotorPositions(msg.command - np.array(offset))
 
-        elif self.motors_mode != msg.state:
-            self.get_logger().info("Motors were active. Stopping motors. Choose mode again. ")
-            self.motors_active = False
-            self.stop_motors()
+            case ControlMode.POSITION_CONTROL:
+                self.get_logger().info("Moving Motors")
 
-        match self.motors_mode:
-            # case 1:
-            #     self.motors[i].axis0.controller.input_torque = command  # type: ignore[attr-defined]
-            #     self.get_logger().info(f"Commanded Torque = {command} nm")
-            # case 2:
-            #     self.motors[i].axis0.controller.input_vel = command  # type: ignore[attr-defined]
-            #     self.get_logger().info(f"Commanded Vel = {command} rev/s")
-            case 3:
+                print(command)
                 self.setCagePosition(command[0], command[1])
-                # self.motors[i].axis0.controller.input_pos = command  # type: ignore[attr-defined]
                 self.get_logger().info(f"Commanded Pos = {command[0]:.2f},{command[1]:.2f}")
             case _:
                 self.get_logger().info("Invalid case...")
 
     def callbackPublishMotorPosition(self):
-        positions = Float32MultiArray
+        positions = Float32MultiArray()
 
-        positions.data = self.getMotorPositions()
+        positions.data = list(self.getMotorPositions())
 
         self.motor_position_pub_.publish(positions)
-
-    def callbackCalculateVelocity(self):
-        window_size = 10
-        dt = 0.01
-
-        position: NDArray = self.getMotorPositions()
-        vel = (position - self.prev_pos) / dt
-        self.prev_pos = position
-
-        self.vel_buffer.append(vel)
-
-        self.vel_avg = sum(self.vel_buffer) / len(self.vel_buffer)
 
 
 def main(args=None):
